@@ -37,14 +37,17 @@
   (ok (equal expected (final-conflict clauses nvars assumptions))))
 
 (deftest final-conflict-random-against-brute-force
-  ;; 12 variables, 8 assumptions; 3 of them on free variables 13..15.
+  ;; 12 variables, 20..34 clauses, up to 6 assumptions: 4 on the CNF's variables,
+  ;; 2 on free variables 13..15 (a v / -v pair among those forces UNSAT).
+  ;; Parameters chosen so seed 3131 gives both outcomes (21 UNSAT / 19 SAT by
+  ;; brute force); contract amendment 2026-11-24.
   (let ((rng (make-rng 3131)) (unsat-count 0) (sat-count 0) (core-size 0) (assumed 0))
     (dotimes (i 40)
-      (let* ((clauses (random-3sat rng 12 (+ 30 (rng-int rng 20))))
+      (let* ((clauses (random-3sat rng 12 (+ 20 (rng-int rng 15))))
              (assumptions (remove-duplicates
-                           (append (loop repeat 6 collect (let ((v (1+ (rng-int rng 12))))
+                           (append (loop repeat 4 collect (let ((v (1+ (rng-int rng 12))))
                                                             (if (zerop (rng-int rng 2)) v (- v))))
-                                   (loop repeat 3 collect (let ((v (+ 13 (rng-int rng 3))))
+                                   (loop repeat 2 collect (let ((v (+ 13 (rng-int rng 3))))
                                                             (if (zerop (rng-int rng 2)) v (- v)))))
                            :from-end t)))
         (destructuring-bind (core status &optional literals)
@@ -75,14 +78,15 @@
 (defparameter *dpll* (make-instance 'dpll-backend))
 
 (deftest final-conflict-mid-scale-against-dpll
-  ;; 50 variables near the threshold, 12 assumptions: status and the core's
-  ;; unsatisfiability checked with sat-backend-dpll.
+  ;; 50 variables, 170..199 clauses (ratio 3.4..4.0), 4 assumptions: status and
+  ;; the core's unsatisfiability checked with sat-backend-dpll. Seed 3132 gives
+  ;; both outcomes (7 UNSAT / 5 SAT by DPLL); contract amendment 2026-11-24.
   (let ((rng (make-rng 3132)) (unsat-count 0) (sat-count 0))
     (dotimes (i 12)
-      (let* ((clauses (random-3sat rng 50 (+ 180 (rng-int rng 30))))
+      (let* ((clauses (random-3sat rng 50 (+ 170 (rng-int rng 30))))
              (cnf (clauses->cnf clauses 50))
              (assumptions (remove-duplicates
-                           (loop repeat 12 collect (let ((v (1+ (rng-int rng 50))))
+                           (loop repeat 4 collect (let ((v (1+ (rng-int rng 50))))
                                                      (if (zerop (rng-int rng 2)) v (- v))))
                            :key #'abs :from-end t))
              (expected (nth-value 1 (backend-solve *dpll* cnf :assumptions assumptions))))
