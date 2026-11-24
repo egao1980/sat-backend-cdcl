@@ -12,7 +12,7 @@ A [sat-protocol](https://github.com/egao1980/sat-protocol) backend: conflict-dri
 
 Pure Lisp, no dependencies beyond sat-protocol (0.3.0 from version 0.2.0 on; it resolves once sat-protocol 0.3.0 is published).
 
-**Status:** 0.1.0 (slice L2b-3 of Track L); **0.2.0 contracted** (slice L2b-2: sessions). Brief: [cl-stack/docs/capabilities/logic.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/logic.md#l2b-3--sat-backend-cdcl-010-planned-cl-stack370). Motivation: proving optimality on weighted sequence-labelling / chain selection problems, where chronological DPLL finds good models but cannot prove the optimum ([cl-stack#370](https://github.com/egao1980/cl-stack/issues/370)).
+**Status:** 0.1.0 (slice L2b-3 of Track L); **0.2.0 implemented** (slice L2b-2: native incremental sessions). Brief: [cl-stack/docs/capabilities/logic.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/logic.md#l2b-3--sat-backend-cdcl-010-planned-cl-stack370). Motivation: proving optimality on weighted sequence-labelling / chain selection problems, where chronological DPLL finds good models but cannot prove the optimum ([cl-stack#370](https://github.com/egao1980/cl-stack/issues/370)).
 
 ## Use
 

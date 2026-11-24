@@ -1,16 +1,25 @@
-;;;; Per-call state of the CDCL search in search.lisp: literal codes, the
-;;;; %SOLVER structure, the clause store and its watch lists, the decision
-;;;; heap, the trail and its levels, loading a CNF, and publishing the
-;;;; statistics. A %SOLVER lives for one BACKEND-SOLVE or
-;;;; BACKEND-FINAL-CONFLICT call; nothing in it survives the call.
+;;;; State of the CDCL search in search.lisp: literal codes, the %SOLVER
+;;;; structure, the clause store and its watch lists, the decision heap, the
+;;;; trail and its levels, loading a CNF, publishing the statistics, and the
+;;;; session pieces (growth, incremental clauses, the per-call reset). A
+;;;; %SOLVER lives either for one BACKEND-SOLVE or BACKEND-FINAL-CONFLICT call
+;;;; (%SETUP, %LOAD; nothing in it survives the call), or for a session's whole
+;;;; life (session.lisp: %SETUP for no variable and no clause, then grown by
+;;;; %ENSURE-VARIABLES, given clauses by %ADD-INPUT-CLAUSE, and reset per call
+;;;; by %BEGIN-CALL).
 ;;;;
 ;;;; Literal codes: +v is 2v and -v is 2v+1, so negation is (LOGXOR l 1) and
 ;;;; the variable is (ASH l -1). Variable 0 is never assigned, so code 0 is a
 ;;;; literal that is never true.
 ;;;;
-;;;; Clause ids: the input clauses are 0..M-1 in input order; learnt clauses
-;;;; take the ids after them, so a higher id is a younger clause. Ids are never
-;;;; reused. Each clause is a fresh (SIMPLE-ARRAY FIXNUM (*)) of literal codes.
+;;;; Clause ids: every clause, input or learnt, takes the next id; ids are
+;;;; never reused, so among learnt clauses a higher id is a younger clause.
+;;;; Each clause is a fresh (SIMPLE-ARRAY FIXNUM (*)) of literal codes. Input
+;;;; clauses have LBD 0, learnt ones LBD >= 1. INPUTS[k] is the k-th input
+;;;; clause (ordinal k, 0..M-1, in input order), the same vector as its store
+;;;; entry. In a one-shot call the input clauses are ids 0..M-1 (ordinal = id)
+;;;; and learnt clauses take the ids after them; in a session, input clauses
+;;;; added after a call take ids after that call's learnt clauses.
 ;;;;
 ;;;; Watches: WATCHES[l] lists the clauses that watch literal l, as pairs
 ;;;; (entry, blocker) in a fixnum vector with WFILL[l] used entries. It is
@@ -67,12 +76,13 @@
                     (:conc-name s-) (:copier nil) (:predicate nil))
   (backend nil)
   (n 0 :type fixnum)                    ; variables 1..N
-  (m 0 :type fixnum)                    ; input clauses: ids 0..M-1
-  ;; per literal code (2N+2)
+  (m 0 :type fixnum)                    ; input clauses: ordinals 0..M-1 (INPUTS)
+  ;; per literal code (2N+2; in a session, arrays may be longer: capacity)
   (lval (%empty (signed-byte 8)) :type %bytevec)    ; 1 true, -1 false, 0 unassigned
   (watches #() :type simple-vector)                 ; %FIXVEC of (entry, blocker) pairs
   (wfill (%empty fixnum) :type %fixvec)             ; used length of WATCHES[l]
   (in-core (%empty (signed-byte 8)) :type %bytevec) ; final conflict: 1 for the literals of S
+  (mark (%empty fixnum) :type %fixvec)              ; session adds: STAMP marks, repeated literals
   ;; per variable (N+1)
   (level (%empty fixnum) :type %fixvec)
   (reason (%empty fixnum) :type %fixvec)            ; clause id, or -1
@@ -105,8 +115,11 @@
   (clause-deleted (%empty (signed-byte 8)) :type %bytevec)
   (learnts (%empty fixnum) :type %fixvec)           ; the learnt database, oldest first
   (nlearnts 0 :type fixnum)
-  ;; the SAT check (4b): every input clause before SCAN is true; SAT-LIT[id]
-  ;; is a literal that was true in it when last checked (0: none yet)
+  (inputs #() :type simple-vector)                  ; ordinal k -> the k-th input clause
+  (refuted nil)                                     ; the input clauses alone are UNSAT
+  ;; the SAT check (4b): every input clause before SCAN (an ordinal) is true;
+  ;; SAT-LIT[k] is a literal that was true in input clause k when last checked
+  ;; (0: none yet)
   (sat-lit (%empty fixnum) :type %fixvec)
   (scan 0 :type fixnum)
   ;; analysis buffers (N+1)
@@ -147,12 +160,14 @@
   (ring-pos 0 :type fixnum)
   (ring-sum 0 :type fixnum)
   (lbd-total 0 :type fixnum)                        ; every LBD of the call
-  ;; reduction: the next one is due at NEXT-REDUCE learnt clauses
+  ;; reduction: the next one is due at NEXT-REDUCE learnt clauses, counted by
+  ;; ALL-LEARNT over every call on this %SOLVER (LEARNT in a one-shot call)
   (reduce-p t)
   (reduce-base 2000 :type fixnum)
   (reduce-inc 300 :type fixnum)
   (reduce-k 0 :type fixnum)
   (next-reduce 2000 :type fixnum)
+  (all-learnt 0 :type fixnum)
   ;; the statistics (backend.lisp)
   (decisions 0 :type fixnum)
   (propagations 0 :type fixnum)
@@ -173,17 +188,15 @@
               :reductions (s-reductions s) :deleted-clauses (s-deleted s))))
 
 (defun %setup (s n m assumptions order phase budget want-core)
-  "Size S for N variables, M input clauses and ASSUMPTIONS, and take the
-backend's parameters and the call's arguments."
+  "Size S for N variables, M input clauses and ASSUMPTIONS, start the
+reduction schedule, and take the backend's parameters and the call's
+arguments (%BEGIN-CALL)."
   (declare (type %solver s) (type fixnum n m))
   (let* ((backend (s-backend s))
-         (nassumps (length assumptions))
          (nlits (+ 2 (* 2 n)))
          (nvars (1+ n))
-         (nlevels (+ n nassumps 2))
          (capacity (+ m 64))
          (empty (%fixvec 0))
-         (window (%clamp (cdcl-backend-restart-window backend)))
          (base (cdcl-backend-reduce-base backend)))
     (setf (s-n s) n
           (s-m s) m
@@ -200,9 +213,6 @@ backend's parameters and the call's arguments."
           (s-seen s) (%bytevec nvars)
           (s-cand s) (%fixvec nvars)
           (s-trail s) (%fixvec nvars)
-          (s-trail-lim s) (%fixvec nlevels)
-          (s-scan-at s) (%fixvec nlevels)
-          (s-level-stamp s) (%fixvec nlevels)
           (s-heap s) (%fixvec nvars)
           (s-clauses s) (make-array capacity :initial-element empty)
           (s-clause-lbd s) (%fixvec capacity)
@@ -210,11 +220,39 @@ backend's parameters and the call's arguments."
           (s-clause-lock s) (%fixvec capacity)
           (s-clause-deleted s) (%bytevec capacity)
           (s-learnts s) (%fixvec 64)
+          (s-inputs s) (make-array m :initial-element empty)
           (s-sat-lit s) (%fixvec m)
           (s-out s) (%fixvec nvars)
           (s-stack s) (%fixvec nvars)
           (s-toclear s) (%fixvec nvars)
-          (s-assumps s) (let ((codes (%fixvec nassumps)))
+          (s-reduce-p s) (and base t)
+          (s-reduce-base s) (if base (%clamp base) 0)
+          (s-reduce-inc s) (%clamp (cdcl-backend-reduce-increment backend))
+          (s-next-reduce s) (if base (%clamp base) 0))
+    (%begin-call s assumptions order phase budget want-core)))
+
+(defun %begin-call (s assumptions order phase budget want-core)
+  "The per-call fields of S (session.lisp header, Per call): the call's
+arguments, the backend's parameters, restart run 1 (its Luby limit, an empty
+Glucose ring, the LBD total of this call's clauses only), the statistics from
+0, and per-level arrays for N + assumptions + 2 levels. In a session it runs
+at level 0, after %ENSURE-VARIABLES; what persists (clauses, the level-0
+trail, activities and bumps, phases, the reduction schedule) is left alone.
+Returns S."
+  (declare (type %solver s) (type list assumptions))
+  (let* ((backend (s-backend s))
+         (nassumps (length assumptions))
+         (nlevels (+ (s-n s) nassumps 2))
+         (window (%clamp (cdcl-backend-restart-window backend))))
+    (when (< (length (s-trail-lim s)) nlevels)
+      ;; Nothing in them is live at level 0: TRAIL-LIM[0] and SCAN-AT[0] are
+      ;; written when level 1 opens, and fresh LEVEL-STAMP zeros are below
+      ;; STAMP. From a fresh %SOLVER (length 0) this is exactly NLEVELS.
+      (let ((size (max nlevels (* 2 (length (s-trail-lim s))))))
+        (setf (s-trail-lim s) (%fixvec size)
+              (s-scan-at s) (%fixvec size)
+              (s-level-stamp s) (%fixvec size))))
+    (setf (s-assumps s) (let ((codes (%fixvec nassumps)))
                           (loop for a in assumptions for i from 0
                                 do (setf (aref codes i) (%lit a)))
                           codes)
@@ -232,14 +270,26 @@ backend's parameters and the call's arguments."
           (s-cla-decay s) (%double (cdcl-backend-clause-decay backend) 1d-100 1d0)
           (s-restart-policy s) (cdcl-backend-restart-policy backend)
           (s-luby-unit s) (%clamp (cdcl-backend-luby-unit backend))
-          (s-run-limit s) (s-luby-unit s)                       ; luby(1) = 1
+          ;; the restart run: run 1, luby(1) = 1
+          (s-run-k s) 1
+          (s-run-learnt s) 0
+          (s-run-limit s) (s-luby-unit s)
           (s-window s) window
           (s-margin s) (%double (cdcl-backend-restart-margin backend) 0d0 1d300)
           (s-ring s) (%fixvec (min window 64))
-          (s-reduce-p s) (and base t)
-          (s-reduce-base s) (if base (%clamp base) 0)
-          (s-reduce-inc s) (%clamp (cdcl-backend-reduce-increment backend))
-          (s-next-reduce s) (if base (%clamp base) 0))
+          (s-ring-count s) 0
+          (s-ring-pos s) 0
+          (s-ring-sum s) 0
+          (s-lbd-total s) 0
+          ;; the statistics
+          (s-decisions s) 0
+          (s-propagations s) 0
+          (s-conflicts s) 0
+          (s-learnt s) 0
+          (s-backjumps s) 0
+          (s-restarts s) 0
+          (s-reductions s) 0
+          (s-deleted s) 0)
     s))
 
 ;;; ------------------------------------------------------- clauses, watches
@@ -430,6 +480,14 @@ to the heap; the SAT-check scan goes back to where it stood at TARGET."
             (s-scan s) (aref (s-scan-at s) target)
             (s-dl s) target))))
 
+(defun %trail-literals (s)
+  "A fresh list of the trail's integer literals, in assignment order (the
+literals of a SAT answer)."
+  (declare (type %solver s))
+  (let ((trail (s-trail s)))
+    (loop for i from 0 below (s-trail-size s)
+          collect (%int (aref trail i)))))
+
 ;;; ------------------------------------------------------------------- load
 
 (defun %load (s clause-lists)
@@ -446,6 +504,7 @@ else T."
          (m (s-m s))
          (nlits (+ 2 (* 2 n)))
          (clauses (s-clauses s))
+         (inputs (s-inputs s))
          (mark (%fixvec nlits))
          (occurrences (%fixvec nlits))
          (tautology (%bytevec m))
@@ -468,7 +527,8 @@ else T."
                  (incf (s-conflicts s))
                  (return-from %load nil))
                (let ((c (subseq buffer 0 size)))
-                 (setf (svref clauses id) c)
+                 (setf (svref clauses id) c
+                       (svref inputs id) c)
                  (loop for l across c do (setf (aref in-input (ash l -1)) 1))
                  (cond (taut (setf (aref tautology id) 1))
                        ((>= size 2) (loop for l across c do (incf (aref occurrences l))))))))
@@ -499,3 +559,134 @@ else T."
                    (t (%assign s l id)
                     (incf (s-propagations s))))))
     t))
+
+;;; ---------------------------------------------------------------- session
+;;; session.lisp's pieces of a persistent %SOLVER. Every one runs at level 0,
+;;; between two calls.
+
+(defun %ensure-variables (s n)
+  "Grow S to variables 1..N. Capacity doubles (growth is amortised O(1) per
+variable); contents are kept, and new slots start as %SETUP starts them:
+unassigned, reason -1, no phase, activity 0, out of the heap, not an input
+variable. Returns S."
+  (declare (type %solver s) (type fixnum n))
+  (let ((capacity (1- (length (s-level s)))))
+    (when (> n capacity)
+      (let* ((new (max n (* 2 capacity) 16))
+             (nlits (+ 2 (* 2 new)))
+             (nvars (1+ new))
+             ;; Never written: %WATCH allocates before its first write.
+             (empty (%fixvec 0)))
+        (flet ((grow-fix (old size &optional (initial 0))
+                 (replace (%fixvec size initial) old))
+               (grow-byte (old size)
+                 (replace (%bytevec size) old))
+               (grow-double (old size)
+                 (replace (%dblvec size) old)))
+          (setf (s-lval s) (grow-byte (s-lval s) nlits)
+                (s-watches s) (replace (make-array nlits :initial-element empty) (s-watches s))
+                (s-wfill s) (grow-fix (s-wfill s) nlits)
+                (s-in-core s) (grow-byte (s-in-core s) nlits)
+                (s-mark s) (grow-fix (s-mark s) nlits)
+                (s-level s) (grow-fix (s-level s) nvars)
+                (s-reason s) (grow-fix (s-reason s) nvars -1)
+                (s-saved s) (grow-byte (s-saved s) nvars)
+                (s-act s) (grow-double (s-act s) nvars)
+                (s-heap-index s) (grow-fix (s-heap-index s) nvars -1)
+                (s-in-input s) (grow-byte (s-in-input s) nvars)
+                (s-seen s) (grow-byte (s-seen s) nvars)
+                (s-cand s) (grow-fix (s-cand s) nvars)
+                (s-trail s) (grow-fix (s-trail s) nvars)
+                (s-heap s) (grow-fix (s-heap s) nvars)
+                ;; analysis buffers: nothing in them is live between calls
+                (s-out s) (%fixvec nvars)
+                (s-stack s) (%fixvec nvars)
+                (s-toclear s) (%fixvec nvars)))))
+    (when (> n (s-n s))
+      (setf (s-n s) n))
+    s))
+
+(defun %grow-inputs (s)
+  "Double the input-ordinal index (INPUTS and SAT-LIT); ordinals >= M are
+never read."
+  (declare (type %solver s))
+  (let ((new (* 2 (max 32 (length (s-inputs s))))))
+    (setf (s-inputs s) (replace (make-array new :initial-element (%fixvec 0)) (s-inputs s))
+          (s-sat-lit s) (replace (%fixvec new) (s-sat-lit s)))))
+
+(defun %add-input-clause (s clause)
+  "session.lisp's add rule for one CLAUSE (integer literals over 1..N), at
+level 0. Stored after the earlier input clauses as R1 (%LOAD) stores one:
+repeated literals dropped (first occurrences kept), a tautology stored and
+never watched, every variable an input variable and in the heap. Then, against
+the level-0 assignment: a literal true, satisfied for good (not watched); every
+literal false (the empty clause included), REFUTED; exactly one literal not
+false, assigned at level 0 with the clause as its reason (pending: QHEAD is
+left, so it propagates at the next call); otherwise watched on two unassigned
+literals. No search, no statistics, no hook."
+  (declare (type %solver s) (type list clause))
+  (let ((mark (s-mark s)) (lval (s-lval s)) (stamp (incf (s-stamp s)))
+        (codes '()) (size 0) (tautology nil))
+    (declare (type %fixvec mark) (type %bytevec lval) (type fixnum stamp size))
+    (dolist (literal clause)
+      (let ((l (%lit literal)))
+        (unless (= stamp (aref mark l))
+          (when (= stamp (aref mark (logxor l 1)))
+            (setf tautology t))
+          (setf (aref mark l) stamp)
+          (push l codes)
+          (incf size))))
+    (when (zerop size)
+      (setf (s-refuted s) t)
+      (return-from %add-input-clause nil))
+    (let* ((c (make-array size :element-type 'fixnum :initial-contents (nreverse codes)))
+           (id (%add-clause s c 0))
+           (k (s-m s)))
+      (declare (type %fixvec c) (type fixnum id k))
+      (when (= k (length (s-inputs s)))
+        (%grow-inputs s))
+      (setf (svref (s-inputs s) k) c
+            (aref (s-sat-lit s) k) 0
+            (s-m s) (1+ k))
+      ;; Its variables are input variables; an unassigned one joins the heap
+      ;; (one assigned at level 0 never needs a decision).
+      (let ((in-input (s-in-input s)) (index (s-heap-index s)))
+        (loop for l of-type fixnum across c
+              for v of-type fixnum = (ash l -1)
+              do (setf (aref in-input v) 1)
+                 (when (and (minusp (aref index v)) (zerop (aref lval l)))
+                   (%heap-insert s v))))
+      ;; A tautology has a true literal or two unassigned ones: no outcome
+      ;; below applies, and it is never watched.
+      (unless tautology
+        ;; The literals that are not false move to the front, in order.
+        (let ((true 0) (free 0))
+          (declare (type fixnum true free))
+          (loop for i of-type fixnum from 0 below size
+                for l of-type fixnum = (aref c i)
+                do (case (aref lval l)
+                     (1 (setf true l)
+                      (return))
+                     (0 (rotatef (aref c free) (aref c i))
+                      (incf free))))
+          (cond ((plusp true)
+                 (setf (aref (s-sat-lit s) k) true))
+                ((zerop free)
+                 (setf (s-refuted s) t))
+                ((= free 1)
+                 (%assign s (aref c 0) id)
+                 (setf (aref (s-sat-lit s) k) (aref c 0)))
+                (t
+                 (%attach s id))))))
+    nil))
+
+(defun %repair-heap (s)
+  "Put every unassigned input variable that is out of the heap back into it,
+in index order. Needed only after a call cut short between a heap pop and its
+assignment (a throw out of PHASE at 4d); otherwise a no-op."
+  (declare (type %solver s))
+  (let ((lval (s-lval s)) (in-input (s-in-input s)) (index (s-heap-index s)))
+    (loop for v from 1 to (s-n s)
+          when (and (= 1 (aref in-input v)) (minusp (aref index v))
+                    (zerop (aref lval (* 2 v))))
+            do (%heap-insert s v))))

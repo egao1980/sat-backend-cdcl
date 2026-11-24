@@ -1,7 +1,8 @@
 ;;;; Native incremental sessions (0.2.0; sat-protocol 0.3.0, Track L slice
 ;;;; L2b-2). GIVEN: the method signatures and the rules below, which the tests
-;;;; pin. STUBBED (%SESSION-PENDING): the five methods. Add files to the .asd as
-;;;; needed; the rules do not depend on the file layout.
+;;;; pin. IMPLEMENTED: the five methods, here, on solver.lisp's session pieces
+;;;; (%ENSURE-VARIABLES, %ADD-INPUT-CLAUSE, %BEGIN-CALL). Add files to the .asd
+;;;; as needed; the rules do not depend on the file layout.
 ;;;;
 ;;;; The protocol side is sat-protocol's src/session.lisp: front ends, the GF
 ;;;; contract, and the session path of SESSION-MINIMIZE (its strategies push
@@ -77,35 +78,118 @@
 
 (in-package #:sat-backend-cdcl)
 
-(defun %session-pending (name)
-  "Contract stub for sat-backend-cdcl 0.2.0 sessions (sat-protocol 0.3, Track
-L slice L2b-2). Every call is replaced by the implementation, then this
-function is deleted. Signals a SIMPLE-ERROR (deliberately not a SAT-ERROR)."
-  (error "sat-backend-cdcl 0.2 sessions pending: ~S" name))
+;;; Between two operations the solver is consistent in this sense: every
+;;; literal at level 0 is implied by the input clauses given so far (input
+;;; and add-time units, learnt units and their consequences); add-time units
+;;; may still be pending (at or after QHEAD), which the next call's first
+;;; propagation visits; every clause of two or more literals is watched under
+;;; the two-watch invariant, or is a tautology, or is true at level 0 for
+;;; good; every input ordinal before SCAN is true at level 0; and every
+;;; unassigned input variable is in the heap, except after a call cut short
+;;; (DIRTY, repaired by the next operation). Levels above 0 hold only what the
+;;; last call left there, and every operation first undoes them.
+
+(defstruct (%session-state (:constructor %make-session-state (solver))
+                           (:conc-name %state-) (:copier nil) (:predicate nil))
+  "BACKEND-SESSION-OPEN's value: the session's persistent solver and its
+lifecycle."
+  (solver nil :type (or null %solver)) ; NIL once BACKEND-SESSION-CLOSE ran
+  (busy nil)                           ; a call on this state is running
+  (dirty nil))                         ; the last call ended by a non-local exit
+
+(defun %idle-solver (session)
+  "SESSION's solver, ready for an operation, and its state: back to level 0
+(phases saved, as at step 3), the heap repaired after a call cut short.
+SAT-SESSION-CLOSED when the state was dropped (only a caller going around the
+front ends can get here); SAT-ERROR for an operation from a hook or handler
+inside a running call of the same session, which would undo that call's
+levels under it."
+  (let* ((state (session-backend-state session))
+         (s (%state-solver state)))
+    (unless s
+      (error 'sat-session-closed :session session))
+    (when (%state-busy state)
+      (error 'sat-error
+             :message (format nil "~S: a session operation from inside a call of that session"
+                              session)))
+    (%cancel-until s 0)
+    (when (%state-dirty state)
+      (setf (%state-dirty state) nil)
+      (%repair-heap s))
+    (values s state)))
+
+(defun %session-call (session assumptions order phase budget want-core)
+  "search.lisp's call on SESSION's solver: (values T literals NIL) for SAT,
+(values NIL NIL core) for UNSAT, CORE NIL unless WANT-CORE, and NIL when the
+clauses alone are refuted. The statistics are published however the call ends;
+an end by a non-local exit marks the state dirty."
+  (multiple-value-bind (s state) (%idle-solver session)
+    ;; Assumption variables may have arrived with no clause (no backend call).
+    (%ensure-variables s (session-variable-count session))
+    (%begin-call s assumptions order phase budget want-core)
+    (let ((done nil))
+      (setf (%state-busy state) t)
+      (unwind-protect
+           (multiple-value-prog1
+               (cond ((s-refuted s)
+                      ;; UNSAT for good: at once, all statistics 0.
+                      (values nil nil nil))
+                     ((%search s)
+                      (values t (%trail-literals s) nil))
+                     (t
+                      ;; search.lisp, statistics: CONFLICTS - LEARNT-CLAUSES is 1
+                      ;; exactly when a level-0 conflict ended the call (the
+                      ;; clauses alone are refuted), 0 when an assumption was
+                      ;; false at its turn.
+                      (when (> (s-conflicts s) (s-learnt s))
+                        (setf (s-refuted s) t))
+                      (values nil nil (and want-core (%core s assumptions)))))
+             (setf done t))
+        (setf (%state-busy state) nil)
+        (unless done
+          (setf (%state-dirty state) t))
+        ;; S, not the state's slot: a handler may have closed the session.
+        (%publish s)))))
 
 (defmethod backend-session-open ((backend cdcl-backend) session)
-  "A fresh persistent solver state for SESSION (this file's header)."
+  "A fresh persistent solver state for SESSION (this file's header): no
+variable, no clause, the backend's parameters and the reduction schedule at
+its start."
   (declare (ignore session))
-  (%session-pending 'backend-session-open))
+  (%make-session-state (%setup (%make-solver backend) 0 0 '() nil nil nil nil)))
 
 (defmethod backend-session-add-clauses ((backend cdcl-backend) session clauses)
   "Add CLAUSES to SESSION's solver at level 0 (this file's header)."
-  (declare (ignore session clauses))
-  (%session-pending 'backend-session-add-clauses))
+  (let ((s (%idle-solver session)))
+    (%ensure-variables s (session-variable-count session))
+    ;; Once refuted, every answer is UNSAT: later clauses change nothing.
+    (unless (s-refuted s)
+      (dolist (clause clauses)
+        (%add-input-clause s clause)
+        (when (s-refuted s)
+          (return))))
+    nil))
 
 (defmethod backend-session-solve ((backend cdcl-backend) session
                                   &key assumptions order phase budget)
   "search.lisp's call on SESSION's solver state."
-  (declare (ignore session assumptions order phase budget))
-  (%session-pending 'backend-session-solve))
+  (multiple-value-bind (sat literals)
+      (%session-call session assumptions order phase budget nil)
+    (if sat
+        (values literals t)
+        (values nil nil))))
 
 (defmethod backend-session-final-conflict ((backend cdcl-backend) session assumptions
                                            &key budget order phase)
   "search.lisp's call on SESSION's solver state, with the final conflict."
-  (declare (ignore session assumptions budget order phase))
-  (%session-pending 'backend-session-final-conflict))
+  (multiple-value-bind (sat literals core)
+      (%session-call session assumptions order phase budget t)
+    (if sat
+        (values nil nil literals)
+        (values core t))))
 
 (defmethod backend-session-close ((backend cdcl-backend) session)
-  "Drop SESSION's solver state."
-  (declare (ignore session))
-  (%session-pending 'backend-session-close))
+  "Drop SESSION's solver state. A call still running (from a handler that
+closed the session) keeps its own reference and finishes."
+  (setf (%state-solver (session-backend-state session)) nil)
+  nil)
