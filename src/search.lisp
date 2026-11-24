@@ -13,7 +13,8 @@
 ;;;;
 ;;;; ---------------------------------------------------------------- a call
 ;;;; Every call starts from nothing: no clause, activity, phase or counter
-;;;; survives from an earlier call on the same backend (sessions are L2b-2).
+;;;; survives from an earlier call on the same backend. (0.2.0: a session call
+;;;; runs this search on its session's persistent state instead; session.lisp.)
 ;;;; A call is deterministic: the same CNF, arguments and parameters give the
 ;;;; same answer, the same hook calls and the same statistics (no randomness;
 ;;;; nothing depends on hash order or addresses). The CNF is never modified.

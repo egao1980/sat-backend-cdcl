@@ -24,7 +24,8 @@
 ;;;;
 ;;;; CDCL-BACKEND-STATISTICS: NIL before the first call; afterwards a fresh
 ;;;; plist of the last BACKEND-SOLVE / BACKEND-FINAL-CONFLICT call on this
-;;;; backend, with exactly these keys, each a non-negative integer:
+;;;; backend (0.2.0: or BACKEND-SESSION-SOLVE / -FINAL-CONFLICT, session.lisp),
+;;;; with exactly these keys, each a non-negative integer:
 ;;;;   :decisions :propagations :conflicts :learnt-clauses :backjumps
 ;;;;   :restarts :reductions :deleted-clauses
 ;;;; (definitions: search.lisp). The plist is current whenever the search
