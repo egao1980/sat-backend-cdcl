@@ -8,6 +8,7 @@
   :pathname "src"
   :components ((:file "package")
                (:file "backend")
+               (:file "solver")
                (:file "search"))
   :in-order-to ((test-op (test-op "sat-backend-cdcl/tests"))))
 
