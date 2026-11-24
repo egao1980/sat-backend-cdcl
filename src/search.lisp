@@ -13,7 +13,8 @@
 ;;;;
 ;;;; ---------------------------------------------------------------- a call
 ;;;; Every call starts from nothing: no clause, activity, phase or counter
-;;;; survives from an earlier call on the same backend (sessions are L2b-2).
+;;;; survives from an earlier call on the same backend. (0.2.0: a session call
+;;;; runs this search on its session's persistent state instead; session.lisp.)
 ;;;; A call is deterministic: the same CNF, arguments and parameters give the
 ;;;; same answer, the same hook calls and the same statistics (no randomness;
 ;;;; nothing depends on hash order or addresses). The CNF is never modified.
@@ -279,9 +280,11 @@ then restore the heap order (an activity may have reached 0, a new tie)."
     (%heap-rebuild s)))
 
 (defun %rescale-clauses (s)
+  "Scale every clause activity and the bump down together (order kept). Input
+clauses' activities are 0 and stay 0."
   (declare (type %solver s))
   (let ((act (s-clause-act s)))
-    (loop for id from (s-m s) below (s-nclauses s)
+    (loop for id from 0 below (s-nclauses s)
           do (setf (aref act id) (* (aref act id) 1d-20)))
     (setf (s-cla-inc s) (* (s-cla-inc s) 1d-20))))
 
@@ -322,13 +325,14 @@ the literal a reason explains may sit anywhere in it."
            (optimize (speed 3) (safety 1))
            #+sbcl (sb-ext:muffle-conditions sb-ext:compiler-note))
   (let ((clauses (s-clauses s)) (seen (s-seen s)) (level (s-level s)) (reason (s-reason s))
-        (trail (s-trail s)) (out (s-out s)) (m (s-m s)) (dl (s-dl s))
+        (trail (s-trail s)) (out (s-out s)) (lbd (s-clause-lbd s)) (dl (s-dl s))
         (path 0) (size 1) (index (1- (s-trail-size s))) (pvar 0) (p 0))
     (declare (type simple-vector clauses) (type %bytevec seen)
-             (type %fixvec level reason trail out)
-             (type fixnum m dl path size index pvar p))
+             (type %fixvec level reason trail out lbd)
+             (type fixnum dl path size index pvar p))
     (loop
-      (when (>= confl m)
+      ;; A learnt clause (LBD >= 1; input clauses have LBD 0).
+      (when (plusp (aref lbd confl))
         (%bump-clause s confl))
       (let ((c (svref clauses confl)))
         (declare (type %fixvec c))
@@ -618,6 +622,7 @@ RESTART when due."
     (when hook
       (funcall hook (loop for i from 0 below size collect (%int (aref out i))) lbd))
     (incf (s-learnt s))
+    (incf (s-all-learnt s))
     (incf (s-lbd-total s) lbd)
     (%decay s)
     (when (< bt (1- conflict-level))
@@ -633,7 +638,9 @@ RESTART when due."
         (%bump-clause s id))
       (%assign s (aref out 0) id)
       (incf (s-propagations s)))
-    (when (and (s-reduce-p s) (>= (s-learnt s) (s-next-reduce s)))
+    ;; L of REDUCTION: every learnt clause of the %SOLVER's calls (a session's
+    ;; whole life; this call's in a one-shot call).
+    (when (and (s-reduce-p s) (>= (s-all-learnt s) (s-next-reduce s)))
       (%reduce s))
     (when (%restart-due-p s lbd)
       (%restart s))))
@@ -681,15 +688,16 @@ clauses, caching each one's true literal."
   (declare (type %solver s)
            (optimize (speed 3) (safety 1))
            #+sbcl (sb-ext:muffle-conditions sb-ext:compiler-note))
-  (let ((lval (s-lval s)) (clauses (s-clauses s)) (sat-lit (s-sat-lit s))
+  (let ((lval (s-lval s)) (inputs (s-inputs s)) (sat-lit (s-sat-lit s))
         (m (s-m s)) (p (s-scan s)))
-    (declare (type %bytevec lval) (type simple-vector clauses) (type %fixvec sat-lit)
+    (declare (type %bytevec lval) (type simple-vector inputs) (type %fixvec sat-lit)
              (type fixnum m p))
+    ;; P is an input ordinal.
     (loop while (< p m)
           do (unless (= 1 (aref lval (aref sat-lit p)))
                (let ((found 0))
                  (declare (type fixnum found))
-                 (loop for q of-type fixnum across (the %fixvec (svref clauses p))
+                 (loop for q of-type fixnum across (the %fixvec (svref inputs p))
                        when (= 1 (aref lval q))
                          do (setf found q)
                             (return))
@@ -706,10 +714,10 @@ of the unassigned variables of the input clauses with no true literal) and
 return its choice, or signal SAT-ERROR when it is not one of them."
   (declare (type %solver s))
   (let ((stamp (incf (s-stamp s))) (cand (s-cand s)) (lval (s-lval s))
-        (clauses (s-clauses s)) (n (s-n s)))
-    ;; The clauses before SCAN are true (4b just ran).
+        (inputs (s-inputs s)) (n (s-n s)))
+    ;; The input clauses before SCAN (an ordinal) are true (4b just ran).
     (loop for p from (s-scan s) below (s-m s)
-          for c of-type %fixvec = (svref clauses p)
+          for c of-type %fixvec = (svref inputs p)
           unless (loop for q across c thereis (= 1 (aref lval q)))
             do (loop for q across c
                      when (zerop (aref lval q))
@@ -809,10 +817,7 @@ statistics are published however the call ends."
            (%setup s (cnf-variable-count cnf) (length clause-lists)
                    assumptions order phase budget want-core)
            (if (and (%load s clause-lists) (%search s))
-               (values t
-                       (loop for i from 0 below (s-trail-size s)
-                             collect (%int (aref (s-trail s) i)))
-                       nil)
+               (values t (%trail-literals s) nil)
                (values nil nil (and want-core (%core s assumptions)))))
       (%publish s))))
 

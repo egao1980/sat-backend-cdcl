@@ -8,6 +8,13 @@
 ;;;; sat-backend-dpll for mid-sized ones, statuses recorded with MiniSat for
 ;;;; the performance instances (tests/fixtures/PROVENANCE.md), and a dynamic
 ;;;; programme for the chain family (instances.lisp).
+;;;;
+;;;; 0.2.0: the conformance suite includes sat-protocol 0.3's session checks
+;;;; (both configurations); session-test pins the native session (no
+;;;; from-scratch call, learnt clauses survive, per-call statistics and
+;;;; budgets, level-0 additions, cut-short calls, determinism, every
+;;;; configuration against sat-backend-dpll), and session-benchmark reports
+;;;; session against fresh solving on a 50-segment chain (soft: not gated).
 
 (defpackage #:sat-backend-cdcl/tests
   (:use #:cl #:rove #:sat-protocol #:sat-backend-cdcl)
@@ -22,7 +29,15 @@
                 #:clauses-satisfied-p
                 #:model->assignment
                 #:brute-models
-                #:brute-satisfiable-p)
+                #:brute-satisfiable-p
+                ;; 0.2.0 sessions
+                #:lit-formula
+                #:session-from-clauses
+                #:model-satisfies-p
+                #:random-clause*
+                #:random-literals*
+                #:random-objective*
+                #:planted-binary)
   (:import-from #:sat-backend-dpll
                 #:dpll-backend)
   (:export #:run-with-cdcl

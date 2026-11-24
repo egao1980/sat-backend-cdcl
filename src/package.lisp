@@ -3,8 +3,13 @@
 ;;;;
 ;;;; 0.1.0 specialises BACKEND-SOLVE and BACKEND-FINAL-CONFLICT. The other
 ;;;; backend GFs (BACKEND-SOLVE-ALL, BACKEND-MINIMIZE, BACKEND-UNSAT-CORE) keep
-;;;; sat-protocol's default methods, which run on those two. Incremental
-;;;; sessions (sat-protocol 0.3, L2b-2) come in a later version.
+;;;; sat-protocol's default methods, which run on those two.
+;;;;
+;;;; 0.2.0 (sat-protocol 0.3, L2b-2) adds native incremental sessions
+;;;; (src/session.lisp): BACKEND-SESSION-OPEN, -ADD-CLAUSES, -SOLVE,
+;;;; -FINAL-CONFLICT and -CLOSE on one persistent solver per session.
+;;;; BACKEND-SESSION-MINIMIZE keeps sat-protocol's default method, whose
+;;;; session path runs the strategies through that solver.
 
 (defpackage #:sat-backend-cdcl
   (:use #:cl #:sat-protocol)
